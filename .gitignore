@@ -1,0 +1,6 @@
+video_features/
+pose_features/
+features/
+cache/
+checkpoints/
+.ipynb_checkpoints/

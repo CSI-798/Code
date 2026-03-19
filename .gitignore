@@ -4,3 +4,4 @@ features/
 cache/
 checkpoints/
 .ipynb_checkpoints/
+pitch_clips/

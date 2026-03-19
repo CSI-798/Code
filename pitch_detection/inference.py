@@ -13,10 +13,74 @@ from .model import MultiModalBMN
 from .metrics import calculate_segment_iou, evaluate_pitch_detection, extract_segments_from_predictions
 
 
+def _body_center_and_scale(frame_xy: np.ndarray):
+    hips = frame_xy[[11, 12]]
+    shoulders = frame_xy[[5, 6]]
+
+    hip_valid = np.all(hips > 0, axis=1)
+    shoulder_valid = np.all(shoulders > 0, axis=1)
+
+    if np.any(hip_valid):
+        center = hips[hip_valid].mean(axis=0)
+    elif np.any(shoulder_valid):
+        center = shoulders[shoulder_valid].mean(axis=0)
+    else:
+        valid = frame_xy[np.all(frame_xy > 0, axis=1)]
+        if len(valid) == 0:
+            return np.array([0.5, 0.5], dtype=np.float32), 1.0
+        center = valid.mean(axis=0)
+
+    scale_candidates = []
+    if np.all(shoulders > 0):
+        scale_candidates.append(float(np.linalg.norm(shoulders[0] - shoulders[1])))
+    if np.all(hips > 0):
+        scale_candidates.append(float(np.linalg.norm(hips[0] - hips[1])))
+
+    valid = frame_xy[np.all(frame_xy > 0, axis=1)]
+    if len(valid) >= 2:
+        bbox_size = float(np.linalg.norm(valid.max(axis=0) - valid.min(axis=0)))
+        if bbox_size > 0:
+            scale_candidates.append(0.5 * bbox_size)
+
+    scale = np.median(scale_candidates) if len(scale_candidates) > 0 else 1.0
+    scale = float(max(scale, 1e-3))
+
+    return center.astype(np.float32), scale
+
+
+def _build_pose_representation(poses_xy_flat: np.ndarray):
+    if poses_xy_flat.ndim != 2 or poses_xy_flat.shape[1] != 34:
+        return np.zeros((len(poses_xy_flat), 68), dtype=np.float32)
+
+    num_frames = poses_xy_flat.shape[0]
+    rel_coords = np.zeros((num_frames, 34), dtype=np.float32)
+
+    for frame_idx in range(num_frames):
+        frame_xy = poses_xy_flat[frame_idx].reshape(17, 2).astype(np.float32)
+        center, scale = _body_center_and_scale(frame_xy)
+
+        centered = np.zeros_like(frame_xy, dtype=np.float32)
+        valid = np.all(frame_xy > 0, axis=1)
+        if np.any(valid):
+            centered[valid] = (frame_xy[valid] - center) / scale
+            centered = np.clip(centered, -3.0, 3.0)
+
+        rel_coords[frame_idx] = centered.reshape(-1)
+
+    velocities = np.zeros_like(rel_coords, dtype=np.float32)
+    if num_frames > 1:
+        velocities[1:] = rel_coords[1:] - rel_coords[:-1]
+        velocities = np.clip(velocities, -1.5, 1.5)
+
+    return np.concatenate([rel_coords, velocities], axis=1).astype(np.float32)
+
+
 def _default_inference_config(fps=30):
     return {
-        'threshold': 0.5,
+        'threshold': 0.2,
         'low_threshold_ratio': 0.7,
+        'start_threshold': 0.12,
+        'end_threshold': 0.12,
         'min_duration_frames': max(8, int(0.30 * fps)),
         'max_duration_frames': max(20, int(2.20 * fps)),
         'merge_gap_frames': max(1, int(0.08 * fps)),
@@ -35,6 +99,8 @@ def _normalize_inference_config(inference_config, fps=30, threshold_override=Non
 
     cfg['threshold'] = float(min(0.95, max(0.01, cfg['threshold'])))
     cfg['low_threshold_ratio'] = float(min(0.99, max(0.1, cfg['low_threshold_ratio'])))
+    cfg['start_threshold'] = float(min(0.99, max(0.01, cfg['start_threshold'])))
+    cfg['end_threshold'] = float(min(0.99, max(0.01, cfg['end_threshold'])))
     cfg['min_duration_frames'] = int(max(1, cfg['min_duration_frames']))
     cfg['max_duration_frames'] = int(max(cfg['min_duration_frames'], cfg['max_duration_frames']))
     cfg['merge_gap_frames'] = int(max(0, cfg['merge_gap_frames']))
@@ -43,7 +109,7 @@ def _normalize_inference_config(inference_config, fps=30, threshold_override=Non
     return cfg
 
 
-def _decode_pitch_segments(smoothed_predictions, fps, cfg):
+def _decode_pitch_segments(smoothed_predictions, fps, cfg, start_scores=None, end_scores=None):
     pitch_segments = []
     in_pitch = False
     start_frame = 0
@@ -62,7 +128,15 @@ def _decode_pitch_segments(smoothed_predictions, fps, cfg):
 
             if cfg['min_duration_frames'] <= duration_frames <= cfg['max_duration_frames']:
                 avg_conf = float(np.mean(smoothed_predictions[start_frame:end_frame]))
-                if avg_conf >= high_threshold * cfg['min_avg_confidence_ratio']:
+                end_idx = max(start_frame, min(len(smoothed_predictions) - 1, end_frame - 1))
+                start_conf = float(start_scores[start_frame]) if start_scores is not None else high_threshold
+                end_conf = float(end_scores[end_idx]) if end_scores is not None else high_threshold
+
+                if (
+                    avg_conf >= high_threshold * cfg['min_avg_confidence_ratio']
+                    and start_conf >= cfg['start_threshold']
+                    and end_conf >= cfg['end_threshold']
+                ):
                     pitch_segments.append({
                         'start_frame': start_frame,
                         'end_frame': end_frame,
@@ -77,7 +151,14 @@ def _decode_pitch_segments(smoothed_predictions, fps, cfg):
         duration_frames = end_frame - start_frame
         if cfg['min_duration_frames'] <= duration_frames <= cfg['max_duration_frames']:
             avg_conf = float(np.mean(smoothed_predictions[start_frame:end_frame]))
-            if avg_conf >= high_threshold * cfg['min_avg_confidence_ratio']:
+            end_idx = max(start_frame, min(len(smoothed_predictions) - 1, end_frame - 1))
+            start_conf = float(start_scores[start_frame]) if start_scores is not None else high_threshold
+            end_conf = float(end_scores[end_idx]) if end_scores is not None else high_threshold
+            if (
+                avg_conf >= high_threshold * cfg['min_avg_confidence_ratio']
+                and start_conf >= cfg['start_threshold']
+                and end_conf >= cfg['end_threshold']
+            ):
                 pitch_segments.append({
                     'start_frame': start_frame,
                     'end_frame': end_frame,
@@ -106,12 +187,16 @@ def _decode_pitch_segments(smoothed_predictions, fps, cfg):
     return pitch_segments
 
 
-def calibrate_inference_config(prediction_sequences, true_segments_sequences, fps=30):
+def calibrate_inference_config(prediction_sequences, true_segments_sequences, fps=30, iou_thresholds=None):
     """Grid-search inference config using IoU with precision guardrail."""
     if not prediction_sequences or not true_segments_sequences:
         return _default_inference_config(fps), {'score': 0.0, 'precision': 0.0, 'mean_iou': 0.0}
 
-    threshold_grid = [0.45, 0.5, 0.55, 0.6, 0.65]
+    if not iou_thresholds:
+        iou_thresholds = [0.3]
+    iou_thresholds = [float(t) for t in iou_thresholds]
+
+    threshold_grid = [0.1, 0.14, 0.18, 0.22, 0.28, 0.35]
     low_ratio_grid = [0.65, 0.7, 0.75]
     min_duration_grid = [max(6, int(0.25 * fps)), max(8, int(0.30 * fps)), max(10, int(0.35 * fps))]
     max_duration_grid = [max(18, int(1.8 * fps)), max(22, int(2.2 * fps)), max(26, int(2.6 * fps))]
@@ -119,6 +204,8 @@ def calibrate_inference_config(prediction_sequences, true_segments_sequences, fp
 
     best_cfg = _default_inference_config(fps)
     best_metrics = {'score': -1.0, 'precision': 0.0, 'mean_iou': 0.0, 'recall': 0.0}
+    fallback_cfg = _default_inference_config(fps)
+    fallback_metrics = {'score': -1.0, 'precision': 0.0, 'mean_iou': 0.0, 'recall': 0.0}
 
     valid_pairs = [
         (preds, true_segments)
@@ -139,6 +226,8 @@ def calibrate_inference_config(prediction_sequences, true_segments_sequences, fp
                             {
                                 'threshold': threshold,
                                 'low_threshold_ratio': low_ratio,
+                                'start_threshold': max(0.06, threshold * 0.55),
+                                'end_threshold': max(0.06, threshold * 0.55),
                                 'min_duration_frames': min_duration,
                                 'max_duration_frames': max_duration,
                                 'merge_gap_frames': merge_gap,
@@ -151,23 +240,38 @@ def calibrate_inference_config(prediction_sequences, true_segments_sequences, fp
                             smoothed = uniform_filter1d(preds, size=cfg['smoothing_size']) if len(preds) > 3 else preds
                             pred_segments = _decode_pitch_segments(smoothed, fps=fps, cfg=cfg)
                             pred_pairs = [(seg['start_frame'], seg['end_frame']) for seg in pred_segments]
-                            metrics_list.append(evaluate_pitch_detection(pred_pairs, true_segments, iou_threshold=0.3))
+                            threshold_metrics = [
+                                evaluate_pitch_detection(pred_pairs, true_segments, iou_threshold=t)
+                                for t in iou_thresholds
+                            ]
+                            metrics_list.append({
+                                'mean_iou': float(np.mean([m['mean_iou'] for m in threshold_metrics])),
+                                'precision': float(np.mean([m['precision'] for m in threshold_metrics])),
+                                'recall': float(np.mean([m['recall'] for m in threshold_metrics])),
+                            })
 
                         mean_iou = float(np.mean([m['mean_iou'] for m in metrics_list]))
                         precision = float(np.mean([m['precision'] for m in metrics_list]))
                         recall = float(np.mean([m['recall'] for m in metrics_list]))
+                        raw_score = 0.60 * mean_iou + 0.30 * precision + 0.10 * recall
+
+                        if raw_score > fallback_metrics['score']:
+                            fallback_metrics = {'score': raw_score, 'precision': precision, 'mean_iou': mean_iou, 'recall': recall}
+                            fallback_cfg = cfg
 
                         # Precision floor to avoid choosing degenerate very-high-threshold configs
-                        if precision < 0.08:
+                        if precision < 0.02:
                             continue
 
-                        score = 0.60 * mean_iou + 0.30 * precision + 0.10 * recall
+                        score = raw_score
 
                         if score > best_metrics['score']:
                             best_metrics = {'score': score, 'precision': precision, 'mean_iou': mean_iou, 'recall': recall}
                             best_cfg = cfg
 
     if best_metrics['score'] < 0:
+        if fallback_metrics['score'] >= 0:
+            return fallback_cfg, fallback_metrics
         return _default_inference_config(fps), {'score': 0.0, 'precision': 0.0, 'mean_iou': 0.0, 'recall': 0.0}
 
     return best_cfg, best_metrics
@@ -302,6 +406,12 @@ def predict_pitch_timestamps(model, pose_file, video_file, window_size=100, stri
     # Load pose data with proper error handling
     with open(pose_file, 'r') as f:
         pose_json = json.load(f)
+
+    pose_meta = pose_json.get('metadata', {})
+    frame_width = float(pose_meta.get('width', 1920) or 1920)
+    frame_height = float(pose_meta.get('height', 1080) or 1080)
+    frame_width = max(1.0, frame_width)
+    frame_height = max(1.0, frame_height)
     
     # Process poses frame by frame to handle missing poses
     poses_list = []
@@ -317,22 +427,27 @@ def predict_pitch_timestamps(model, pose_file, video_file, window_size=100, stri
 
             keypoints = selected_pose['keypoints']
             if len(keypoints) == 34:  # Ensure we have x,y for 17 joints
-                poses_list.append(keypoints)
+                kp = np.asarray(keypoints, dtype=np.float32).reshape(17, 2)
+                kp[:, 0] = np.clip(kp[:, 0] / frame_width, 0.0, 1.0)
+                kp[:, 1] = np.clip(kp[:, 1] / frame_height, 0.0, 1.0)
+                poses_list.append(kp.reshape(-1))
             else:
                 poses_list.append(np.zeros(34))  # Fallback for malformed data
         else:
             poses_list.append(np.zeros(34))  # No pose detected
     
-    # Convert to numpy array safely
-    poses = np.array(poses_list)
+    # Convert to numpy array safely and build body-centric+velocity representation
+    poses = np.array(poses_list, dtype=np.float32)
+    extended_poses = _build_pose_representation(poses)
     
-    # Extend to 68 features
-    extended_poses = np.zeros((poses.shape[0], 68))
-    extended_poses[:, :34] = poses
-    extended_poses[:, 34:51] = 0.8  # Default confidence
-    extended_poses[:, 51:68] = 1.0  # Default visibility
-    
-    video_features = np.load(video_file)
+    video_features = np.load(video_file).astype(np.float32)
+    if video_features.ndim != 2:
+        video_features = np.reshape(video_features, (video_features.shape[0], -1))
+
+    vf_mean = np.mean(video_features, axis=0, keepdims=True)
+    vf_std = np.std(video_features, axis=0, keepdims=True)
+    video_features = (video_features - vf_mean) / (vf_std + 1e-6)
+    video_features = np.clip(video_features, -5.0, 5.0)
     
     # Sync lengths
     min_len = min(len(extended_poses), len(video_features))
@@ -344,6 +459,8 @@ def predict_pitch_timestamps(model, pose_file, video_file, window_size=100, stri
     # Create sliding windows for prediction
     model.eval()
     predictions = np.zeros(min_len)
+    start_predictions = np.zeros(min_len)
+    end_predictions = np.zeros(min_len)
     window_counts = np.zeros(min_len)  # Track overlapping windows
     
     with torch.no_grad():
@@ -369,15 +486,23 @@ def predict_pitch_timestamps(model, pose_file, video_file, window_size=100, stri
             
             outputs = model(pose_tensor, video_tensor)
             frame_preds = outputs['frame_predictions'].cpu().numpy()[0]
+            start_preds = outputs['start_predictions'].cpu().numpy()[0]
+            end_preds = outputs['end_predictions'].cpu().numpy()[0]
             
             # Only use predictions for actual frames (not padded ones)
             valid_preds = frame_preds[:actual_window_size]
+            valid_start = start_preds[:actual_window_size]
+            valid_end = end_preds[:actual_window_size]
             predictions[start:end] += valid_preds
+            start_predictions[start:end] += valid_start
+            end_predictions[start:end] += valid_end
             window_counts[start:end] += 1
     
     # Average overlapping predictions
     mask = window_counts > 0
     predictions[mask] = predictions[mask] / window_counts[mask]
+    start_predictions[mask] = start_predictions[mask] / window_counts[mask]
+    end_predictions[mask] = end_predictions[mask] / window_counts[mask]
     
     cfg = _normalize_inference_config(inference_config, fps=fps, threshold_override=threshold)
 
@@ -386,6 +511,14 @@ def predict_pitch_timestamps(model, pose_file, video_file, window_size=100, stri
         smoothed_predictions = uniform_filter1d(predictions, size=cfg['smoothing_size'])
     else:
         smoothed_predictions = predictions
+
+    boundary_smoothing = max(3, cfg['smoothing_size'] // 2)
+    if len(start_predictions) > boundary_smoothing:
+        smoothed_start = uniform_filter1d(start_predictions, size=boundary_smoothing)
+        smoothed_end = uniform_filter1d(end_predictions, size=boundary_smoothing)
+    else:
+        smoothed_start = start_predictions
+        smoothed_end = end_predictions
     
     # Debug: Print prediction statistics
     print(f"Raw prediction stats: min={np.min(predictions):.6f}, max={np.max(predictions):.6f}, mean={np.mean(predictions):.6f}")
@@ -411,11 +544,18 @@ def predict_pitch_timestamps(model, pose_file, video_file, window_size=100, stri
     print(
         f"Using inference config: threshold={cfg['threshold']:.3f}, "
         f"low_ratio={cfg['low_threshold_ratio']:.2f}, "
+        f"start_thr={cfg['start_threshold']:.2f}, end_thr={cfg['end_threshold']:.2f}, "
         f"min_dur={cfg['min_duration_frames']}f, max_dur={cfg['max_duration_frames']}f, "
         f"merge_gap={cfg['merge_gap_frames']}f"
     )
 
-    pitch_segments = _decode_pitch_segments(smoothed_predictions, fps=fps, cfg=cfg)
+    pitch_segments = _decode_pitch_segments(
+        smoothed_predictions,
+        fps=fps,
+        cfg=cfg,
+        start_scores=smoothed_start,
+        end_scores=smoothed_end,
+    )
 
     print(f"Found {len(pitch_segments)} pitch segments with constrained logic")
     return pitch_segments, predictions

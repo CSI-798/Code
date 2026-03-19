@@ -36,6 +36,7 @@ class GPUSlidingWindowDataset(Dataset):
         self.pose_noise_std = max(0.0, float(pose_noise_std))
         self.video_noise_std = max(0.0, float(video_noise_std))
         self.feature_dropout_prob = min(1.0, max(0.0, float(feature_dropout_prob)))
+        self.boundary_radius = 2
         
         # Load all data
         self.pose_data = []
@@ -46,6 +47,12 @@ class GPUSlidingWindowDataset(Dataset):
             # Load pose features with proper error handling
             with open(pose_file, 'r') as f:
                 pose_json = json.load(f)
+
+            pose_meta = pose_json.get('metadata', {})
+            frame_width = float(pose_meta.get('width', 1920) or 1920)
+            frame_height = float(pose_meta.get('height', 1080) or 1080)
+            frame_width = max(1.0, frame_width)
+            frame_height = max(1.0, frame_height)
             
             # Process poses frame by frame to handle missing poses
             poses_list = []
@@ -61,23 +68,28 @@ class GPUSlidingWindowDataset(Dataset):
 
                     keypoints = selected_pose['keypoints']
                     if len(keypoints) == 34:  # Ensure we have x,y for 17 joints
-                        poses_list.append(keypoints)
+                        kp = np.asarray(keypoints, dtype=np.float32).reshape(17, 2)
+                        kp[:, 0] = np.clip(kp[:, 0] / frame_width, 0.0, 1.0)
+                        kp[:, 1] = np.clip(kp[:, 1] / frame_height, 0.0, 1.0)
+                        poses_list.append(kp.reshape(-1))
                     else:
                         poses_list.append(np.zeros(34))  # Fallback for malformed data
                 else:
                     poses_list.append(np.zeros(34))  # No pose detected
             
             # Convert to numpy array safely
-            poses = np.array(poses_list)
-            
-            # Extend to 68 features (add confidence and visibility)
-            extended_poses = np.zeros((poses.shape[0], 68))
-            extended_poses[:, :34] = poses
-            extended_poses[:, 34:51] = 0.8  # Default confidence for 17 joints
-            extended_poses[:, 51:68] = 1.0  # Default visibility for 17 joints
+            poses = np.array(poses_list, dtype=np.float32)
+            extended_poses = self._build_pose_representation(poses)
             
             # Load video features
-            video_features = np.load(video_files[i] if i < len(video_files) else video_files[0])
+            video_features = np.load(video_files[i] if i < len(video_files) else video_files[0]).astype(np.float32)
+            if video_features.ndim != 2:
+                video_features = np.reshape(video_features, (video_features.shape[0], -1))
+
+            vf_mean = np.mean(video_features, axis=0, keepdims=True)
+            vf_std = np.std(video_features, axis=0, keepdims=True)
+            video_features = (video_features - vf_mean) / (vf_std + 1e-6)
+            video_features = np.clip(video_features, -5.0, 5.0)
             
             # DEBUG: Print loaded data lengths
             print(f"  DEBUG - Video {i+1}: Loaded {len(extended_poses)} pose frames, {len(video_features)} video frames")
@@ -130,16 +142,26 @@ class GPUSlidingWindowDataset(Dataset):
         
         # Create sliding windows
         self.windows = []
+        self.window_is_positive = []
         for video_idx in range(len(self.pose_data)):
             num_frames = len(self.pose_data[video_idx])
             for start in range(0, max(1, num_frames - window_size + 1), stride):
                 end = start + window_size
                 if end <= num_frames:  # Ensure we don't exceed bounds
+                    has_pitch = False
+                    for segment in self.labels[video_idx].get('segments', []):
+                        seg_start = segment['start_frame']
+                        seg_end = segment['end_frame']
+                        if seg_end > start and seg_start < end:
+                            has_pitch = True
+                            break
+
                     self.windows.append({
                         'video_idx': video_idx,
                         'start_frame': start,
                         'end_frame': end
                     })
+                    self.window_is_positive.append(has_pitch)
         
         print(f"Dataset created: {len(self.windows)} windows from {len(pose_files)} videos")
         if len(self.windows) == 0:
@@ -151,6 +173,80 @@ class GPUSlidingWindowDataset(Dataset):
                 f"pose_noise={self.pose_noise_std}, video_noise={self.video_noise_std}, "
                 f"dropout={self.feature_dropout_prob}"
             )
+
+        positive_windows = sum(1 for flag in self.window_is_positive if flag)
+        total_windows = len(self.window_is_positive)
+        if total_windows > 0:
+            print(
+                f"Window balance: {positive_windows}/{total_windows} "
+                f"({positive_windows / total_windows:.1%}) windows contain pitch"
+            )
+
+    def get_window_positive_flags(self):
+        """Return whether each base sliding window contains any pitch frames."""
+        return self.window_is_positive
+
+    def _body_center_and_scale(self, frame_xy: np.ndarray) -> Tuple[np.ndarray, float]:
+        """Compute body anchor center and scale from COCO joints (normalized coords)."""
+        hips = frame_xy[[11, 12]]
+        shoulders = frame_xy[[5, 6]]
+
+        hip_valid = np.all(hips > 0, axis=1)
+        shoulder_valid = np.all(shoulders > 0, axis=1)
+
+        if np.any(hip_valid):
+            center = hips[hip_valid].mean(axis=0)
+        elif np.any(shoulder_valid):
+            center = shoulders[shoulder_valid].mean(axis=0)
+        else:
+            valid = frame_xy[np.all(frame_xy > 0, axis=1)]
+            if len(valid) == 0:
+                return np.array([0.5, 0.5], dtype=np.float32), 1.0
+            center = valid.mean(axis=0)
+
+        scale_candidates = []
+        if np.all(shoulders > 0):
+            scale_candidates.append(float(np.linalg.norm(shoulders[0] - shoulders[1])))
+        if np.all(hips > 0):
+            scale_candidates.append(float(np.linalg.norm(hips[0] - hips[1])))
+
+        valid = frame_xy[np.all(frame_xy > 0, axis=1)]
+        if len(valid) >= 2:
+            bbox_size = float(np.linalg.norm(valid.max(axis=0) - valid.min(axis=0)))
+            if bbox_size > 0:
+                scale_candidates.append(0.5 * bbox_size)
+
+        scale = np.median(scale_candidates) if len(scale_candidates) > 0 else 1.0
+        scale = float(max(scale, 1e-3))
+
+        return center.astype(np.float32), scale
+
+    def _build_pose_representation(self, poses_xy_flat: np.ndarray) -> np.ndarray:
+        """Build 68-dim representation: 34 body-centric coords + 34 velocities."""
+        if poses_xy_flat.ndim != 2 or poses_xy_flat.shape[1] != 34:
+            return np.zeros((len(poses_xy_flat), 68), dtype=np.float32)
+
+        num_frames = poses_xy_flat.shape[0]
+        rel_coords = np.zeros((num_frames, 34), dtype=np.float32)
+
+        for frame_idx in range(num_frames):
+            frame_xy = poses_xy_flat[frame_idx].reshape(17, 2).astype(np.float32)
+            center, scale = self._body_center_and_scale(frame_xy)
+
+            centered = np.zeros_like(frame_xy, dtype=np.float32)
+            valid = np.all(frame_xy > 0, axis=1)
+            if np.any(valid):
+                centered[valid] = (frame_xy[valid] - center) / scale
+                centered = np.clip(centered, -3.0, 3.0)
+
+            rel_coords[frame_idx] = centered.reshape(-1)
+
+        velocities = np.zeros_like(rel_coords, dtype=np.float32)
+        if num_frames > 1:
+            velocities[1:] = rel_coords[1:] - rel_coords[:-1]
+            velocities = np.clip(velocities, -1.5, 1.5)
+
+        return np.concatenate([rel_coords, velocities], axis=1).astype(np.float32)
 
     def _temporal_shift_arrays(
         self,
@@ -224,6 +320,16 @@ class GPUSlidingWindowDataset(Dataset):
             aug_video *= keep_mask
 
         return aug_pose, aug_video, aug_frame, aug_start, aug_end
+
+    def _apply_soft_boundary(self, labels: np.ndarray, center_idx: int):
+        if center_idx < 0 or center_idx >= len(labels):
+            return
+        for offset in range(-self.boundary_radius, self.boundary_radius + 1):
+            idx = center_idx + offset
+            if 0 <= idx < len(labels):
+                value = 1.0 - (abs(offset) / (self.boundary_radius + 1))
+                if value > labels[idx]:
+                    labels[idx] = value
     
     def __len__(self):
         if self.augment:
@@ -276,11 +382,11 @@ class GPUSlidingWindowDataset(Dataset):
                     
                     # Mark start boundary
                     if window_seg_start < self.window_size:
-                        start_labels[window_seg_start] = 1.0
+                        self._apply_soft_boundary(start_labels, window_seg_start)
                     
                     # Mark end boundary  
                     if window_seg_end > 0 and window_seg_end <= self.window_size:
-                        end_labels[window_seg_end-1] = 1.0
+                        self._apply_soft_boundary(end_labels, window_seg_end - 1)
 
         should_augment = self.augment and augment_replica > 0
         if should_augment:
@@ -302,12 +408,13 @@ class GPUSlidingWindowDataset(Dataset):
         }
 
 
-def create_dataloader(dataset, batch_size=32, num_workers=2, shuffle=True):
+def create_dataloader(dataset, batch_size=32, num_workers=2, shuffle=True, sampler=None):
     """Create optimized dataloader"""
     return DataLoader(
         dataset, 
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available()
     )

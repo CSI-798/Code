@@ -46,6 +46,18 @@ class MultiModalBMN(nn.Module):
             bidirectional=True,
         )
         self.rnn_projection = nn.Linear(hidden_dim * 2, hidden_dim)
+
+        # Multi-scale temporal pyramid for variable action durations
+        self.temporal_pyramid = nn.ModuleList([
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1, dilation=1),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=2, dilation=2),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=4, dilation=4),
+        ])
+        self.temporal_fusion = nn.Sequential(
+            nn.Conv1d(hidden_dim * 3, hidden_dim, kernel_size=1),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+        )
         
         # Prediction heads
         self.frame_predictor = nn.Linear(hidden_dim, 1)
@@ -86,6 +98,12 @@ class MultiModalBMN(nn.Module):
         # Sequence-aware temporal modeling (captures longer action dynamics)
         rnn_features, _ = self.temporal_rnn(temporal_features)
         temporal_features = self.rnn_projection(rnn_features)
+
+        # Multi-scale temporal fusion (improves TAD boundary quality)
+        pyramid_input = temporal_features.transpose(1, 2)
+        pyramid_features = [torch.relu(branch(pyramid_input)) for branch in self.temporal_pyramid]
+        pyramid_concat = torch.cat(pyramid_features, dim=1)
+        temporal_features = self.temporal_fusion(pyramid_concat).transpose(1, 2)
 
         # Predictions (return logits for training, apply sigmoid during inference)
         frame_logits = self.frame_predictor(temporal_features).squeeze(-1)

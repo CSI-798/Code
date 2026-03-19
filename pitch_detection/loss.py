@@ -105,7 +105,7 @@ def calculate_tversky_loss(predictions, targets, alpha=0.7, beta=0.3, smooth=1e-
 
 
 def segment_aware_loss(frame_preds, frame_targets, start_preds, start_targets, end_preds, end_targets, 
-                       use_precision_focus=True, fp_penalty_weight=4.0,
+                       use_precision_focus=True, fp_penalty_weight=2.5,
                        pos_weight=1.0, hard_negative_ratio=0.0):
     """
     Enhanced loss function with multiple improvements:
@@ -161,7 +161,7 @@ def segment_aware_loss(frame_preds, frame_targets, start_preds, start_targets, e
         total_iou_loss += iou_loss
         
         # Add focal loss to handle class imbalance better
-        alpha = 0.35  # Lower positive bias to reduce false positives
+        alpha = 0.5   # Balanced focal weighting to avoid collapsed low outputs
         gamma = 2.0   # Focusing parameter
         
         bce = nn.functional.binary_cross_entropy_with_logits(frame_preds[b], targets, reduction='none')
@@ -174,7 +174,7 @@ def segment_aware_loss(frame_preds, frame_targets, start_preds, start_targets, e
             frame_preds[b],
             targets,
             reduction='none',
-            pos_weight=torch.tensor(min(8.0, float(pos_weight)), device=frame_preds.device)
+            pos_weight=torch.tensor(min(10.0, float(pos_weight)), device=frame_preds.device)
         )
         total_weighted_bce_loss += weighted_bce.mean()
 
@@ -187,7 +187,7 @@ def segment_aware_loss(frame_preds, frame_targets, start_preds, start_targets, e
             if negative_count > 0:
                 # If no positives in this window, still mine a small number of negatives
                 if positive_count == 0:
-                    top_k = min(32, negative_count)
+                    top_k = min(8, negative_count)
                 else:
                     top_k = min(negative_count, max(1, int(positive_count * float(hard_negative_ratio))))
 
@@ -206,7 +206,7 @@ def segment_aware_loss(frame_preds, frame_targets, start_preds, start_targets, e
             total_fp_penalty += fp_penalty
             
             # Tversky loss with FP emphasis (alpha=0.7 means FPs weighted more than FNs)
-            tversky_loss = calculate_tversky_loss(frame_probs, targets, alpha=0.8, beta=0.2)
+            tversky_loss = calculate_tversky_loss(frame_probs, targets, alpha=0.72, beta=0.28)
             total_tversky_loss += tversky_loss
         
         # Simplified boundary loss - only if we have boundaries
@@ -237,14 +237,14 @@ def segment_aware_loss(frame_preds, frame_targets, start_preds, start_targets, e
         # Tversky already includes IoU-like behavior but with FP emphasis
         # We combine it with explicit precision terms for maximum FP control
         combined_loss = (
-            0.22 * avg_tversky_loss +       # Primary segmentation with strong FP emphasis
-            0.18 * avg_precision_loss +     # Explicit precision optimization
-            0.22 * avg_fp_penalty +         # Direct FP penalization
-            0.10 * avg_weighted_bce_loss +  # Imbalance-aware frame classification
-            0.06 * avg_focal_loss +         # Class imbalance handling
-            0.08 * avg_segment_loss +       # Boundary detection
-            0.04 * avg_iou_loss +           # Basic overlap signal
-            0.10 * avg_hard_negative_loss   # Strong focus on hardest negatives
+            0.26 * avg_tversky_loss +       # Primary segmentation objective
+            0.12 * avg_precision_loss +     # Precision optimization
+            0.12 * avg_fp_penalty +         # FP penalization
+            0.18 * avg_weighted_bce_loss +  # Strong class-imbalance supervision
+            0.10 * avg_focal_loss +         # Class imbalance handling
+            0.12 * avg_segment_loss +       # Boundary detection
+            0.06 * avg_iou_loss +           # Overlap signal
+            0.04 * avg_hard_negative_loss   # Hard negatives without collapse
         )
         
         return combined_loss

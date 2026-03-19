@@ -8,12 +8,14 @@ import torch
 import torch.optim as optim
 import numpy as np
 from tqdm import tqdm
+from torch.utils.data import WeightedRandomSampler, Subset
 
 from .model import MultiModalBMN
 from .dataset import GPUSlidingWindowDataset, create_dataloader
 from .loss import segment_aware_loss, calculate_iou_loss
 from .metrics import (
     extract_segments_from_predictions,
+    extract_segments_strict,
     evaluate_pitch_detection,
     analyze_dataset_distribution
 )
@@ -26,6 +28,8 @@ def train_pitch_detector(
     label_files,
     num_epochs=10,
     batch_size=32,
+    window_size=100,
+    stride=50,
     lr=0.001,
     save_best=True,
     checkpoint_dir="./checkpoints",
@@ -38,6 +42,9 @@ def train_pitch_detector(
     feature_dropout_prob=0.0,
     val_ratio=0.33,
     hard_negative_ratio=3.0,
+    iou_thresholds=None,
+    balance_windows=True,
+    positive_window_target=0.5,
 ):
     """
     Train the pitch detection model with IoU-optimized loss function and best model saving.
@@ -62,6 +69,10 @@ def train_pitch_detector(
     if save_best:
         os.makedirs(checkpoint_dir, exist_ok=True)
         print(f"📁 Checkpoint directory: {checkpoint_dir}")
+
+    if not iou_thresholds:
+        iou_thresholds = [0.3]
+    iou_thresholds = [float(t) for t in iou_thresholds]
     
     num_files = min(len(pose_files), len(video_files), len(label_files))
     if num_files <= 0:
@@ -71,33 +82,49 @@ def train_pitch_detector(
     video_files = video_files[:num_files]
     label_files = label_files[:num_files]
 
-    has_validation = num_files >= 2 and val_ratio > 0
-    val_count = int(round(num_files * float(val_ratio))) if has_validation else 0
+    all_pose_files = pose_files
+    all_video_files = video_files
+    all_label_files = label_files
+
+    # Build base dataset for window-level split across all games
+    base_dataset = GPUSlidingWindowDataset(
+        all_pose_files,
+        all_video_files,
+        all_label_files,
+        window_size=window_size,
+        stride=stride,
+        augment=False,
+    )
+
+    total_base_windows = len(base_dataset)
+    has_validation = total_base_windows >= 2 and val_ratio > 0
+    val_count = int(round(total_base_windows * float(val_ratio))) if has_validation else 0
     if has_validation:
-        val_count = max(1, min(num_files - 1, val_count))
+        val_count = max(1, min(total_base_windows - 1, val_count))
+
+    indices = np.arange(total_base_windows)
+    rng = np.random.default_rng(42)
+    rng.shuffle(indices)
 
     if val_count > 0:
-        train_pose_files = pose_files[:-val_count]
-        train_video_files = video_files[:-val_count]
-        train_label_files = label_files[:-val_count]
-        val_pose_files = pose_files[-val_count:]
-        val_video_files = video_files[-val_count:]
-        val_label_files = label_files[-val_count:]
+        val_base_indices = indices[:val_count].tolist()
+        train_base_indices = indices[val_count:].tolist()
     else:
-        train_pose_files = pose_files
-        train_video_files = video_files
-        train_label_files = label_files
-        val_pose_files = []
-        val_video_files = []
-        val_label_files = []
+        val_base_indices = []
+        train_base_indices = indices.tolist()
 
-    print(f"📚 File split: train={len(train_pose_files)} | val={len(val_pose_files)}")
+    print(
+        f"📚 Window split across all games: train={len(train_base_indices)} "
+        f"| val={len(val_base_indices)} (val_ratio={val_ratio:.2f})"
+    )
 
-    # Create dataset and dataloader
-    dataset = GPUSlidingWindowDataset(
-        train_pose_files,
-        train_video_files,
-        train_label_files,
+    # Create train dataset (with optional augmentation)
+    train_dataset = GPUSlidingWindowDataset(
+        all_pose_files,
+        all_video_files,
+        all_label_files,
+        window_size=window_size,
+        stride=stride,
         augment=use_augmentation,
         augment_factor=augment_factor,
         temporal_shift=temporal_shift,
@@ -105,18 +132,67 @@ def train_pitch_detector(
         video_noise_std=video_noise_std,
         feature_dropout_prob=feature_dropout_prob,
     )
-    dataloader = create_dataloader(dataset, batch_size=batch_size, shuffle=True)
+
+    train_subset_indices = []
+    base_window_count = len(train_dataset.windows)
+    replica_count = train_dataset.augment_factor if train_dataset.augment else 1
+    for replica in range(replica_count):
+        offset = replica * base_window_count if train_dataset.augment else 0
+        train_subset_indices.extend([offset + idx for idx in train_base_indices])
+
+    train_data = Subset(train_dataset, train_subset_indices)
+
+    train_sampler = None
+    if balance_windows:
+        window_flags = train_dataset.get_window_positive_flags()
+        if window_flags and train_base_indices:
+            selected_flags = [window_flags[idx] for idx in train_base_indices]
+            positive_count = sum(1 for flag in selected_flags if flag)
+            negative_count = len(selected_flags) - positive_count
+            target = min(0.95, max(0.05, float(positive_window_target)))
+
+            if positive_count > 0 and negative_count > 0:
+                pos_weight_window = target / positive_count
+                neg_weight_window = (1.0 - target) / negative_count
+                base_weights = [pos_weight_window if flag else neg_weight_window for flag in selected_flags]
+
+                if train_dataset.augment and train_dataset.augment_factor > 1:
+                    sample_weights = base_weights * train_dataset.augment_factor
+                else:
+                    sample_weights = base_weights
+
+                train_sampler = WeightedRandomSampler(
+                    weights=torch.DoubleTensor(sample_weights),
+                    num_samples=len(sample_weights),
+                    replacement=True,
+                )
+                print(
+                    f"🎚️ Balanced window sampling enabled: target positive ratio={target:.2f}, "
+                    f"base positive windows={positive_count}/{len(selected_flags)}"
+                )
+            else:
+                print("⚠️ Could not enable balanced sampling (missing positive or negative windows)")
+
+    dataloader = create_dataloader(
+        train_data,
+        batch_size=batch_size,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
+    )
 
     val_dataset = None
     val_dataloader = None
-    if len(val_pose_files) > 0:
+    if len(val_base_indices) > 0:
         val_dataset = GPUSlidingWindowDataset(
-            val_pose_files,
-            val_video_files,
-            val_label_files,
+            all_pose_files,
+            all_video_files,
+            all_label_files,
+            window_size=window_size,
+            stride=stride,
             augment=False,
         )
-        val_dataloader = create_dataloader(val_dataset, batch_size=batch_size, shuffle=False)
+        val_data = Subset(val_dataset, val_base_indices)
+        val_dataloader = create_dataloader(val_data, batch_size=batch_size, shuffle=False)
 
     if use_augmentation:
         print("🧪 Data augmentation enabled")
@@ -127,7 +203,7 @@ def train_pitch_detector(
         print(f"   Feature dropout: {feature_dropout_prob}")
     
     # Analyze dataset distribution before training
-    dataset_stats = analyze_dataset_distribution(dataset)
+    dataset_stats = analyze_dataset_distribution(Subset(base_dataset, train_base_indices))
     
     # Enhanced class weight calculation for better IoU performance
     pitch_ratio = dataset_stats['pitch_ratio']
@@ -169,9 +245,21 @@ def train_pitch_detector(
     
     print(f"🚀 Starting IoU-optimized training with {num_epochs} epochs...")
     print(f"   Batch size: {batch_size}")
+    print(f"   Window size: {window_size}")
+    print(f"   Stride: {stride}")
     print(f"   Learning rate: {lr}")
-    print(f"   Total windows: {len(dataset)}")
+    print(f"   Total train windows: {len(train_data)}")
     print(f"   Focus: Maximizing mean IoU performance")
+    print(f"   Eval IoU thresholds: {', '.join(f'{t:.2f}' for t in iou_thresholds)}")
+
+    eval_threshold = 0.20
+    eval_min_duration = max(6, int(0.25 * train_dataset.fps))
+    eval_max_duration = max(20, int(2.5 * train_dataset.fps))
+    eval_merge_gap = max(0, int(0.05 * train_dataset.fps))
+    print(
+        f"   Eval segment decoding: thr={eval_threshold:.2f}, min={eval_min_duration}f, "
+        f"max={eval_max_duration}f, gap={eval_merge_gap}f"
+    )
     
     # Training loop with IoU-focused loss
     model.train()
@@ -246,29 +334,20 @@ def train_pitch_detector(
                             calibration_true_segments.append(
                                 extract_segments_from_predictions(batch_labels[i], threshold=0.5, min_duration=1)
                             )
-                    
-                    # Enhanced adaptive threshold for better IoU
+
+                    # Stable, strict thresholding for training metrics
                     for i in range(min(5, len(batch_preds))):  # More samples for better stats
-                        pred_mean = np.mean(batch_preds[i])
-                        pred_std = np.std(batch_preds[i])
-                        pred_max = np.max(batch_preds[i])
-                        
-                        # Smarter threshold that considers prediction distribution
-                        if pred_max < 0.1:  # Very low predictions
-                            adaptive_threshold = max(0.05, pred_mean + 2 * pred_std)
-                        elif pred_std < 0.01:  # Very uniform predictions
-                            adaptive_threshold = max(0.1, pred_mean + pred_std)
-                        else:  # Normal case - optimize for IoU
-                            adaptive_threshold = min(0.4, max(0.15, pred_mean + 0.5 * pred_std))
-                        
-                        # More conservative threshold to improve precision and IoU
-                        pred_segments = extract_segments_from_predictions(
-                            batch_preds[i], threshold=adaptive_threshold, min_duration=3
+                        pred_segments = extract_segments_strict(
+                            batch_preds[i],
+                            threshold=eval_threshold,
+                            min_duration=eval_min_duration,
+                            max_duration=eval_max_duration,
+                            merge_gap=eval_merge_gap,
                         )
                         true_segments = extract_segments_from_predictions(
                             batch_labels[i], threshold=0.5, min_duration=1
                         )
-                        
+
                         all_predictions.append(pred_segments)
                         all_true_segments.append(true_segments)
             
@@ -297,8 +376,16 @@ def train_pitch_detector(
         valid_samples = 0
         
         for pred_segs, true_segs in zip(all_predictions, all_true_segments):
-            # Use stricter IoU threshold for evaluation (focusing on quality)
-            metrics = evaluate_pitch_detection(pred_segs, true_segs, iou_threshold=0.3)
+            threshold_metrics = [
+                evaluate_pitch_detection(pred_segs, true_segs, iou_threshold=t)
+                for t in iou_thresholds
+            ]
+            metrics = {
+                'precision': float(np.mean([m['precision'] for m in threshold_metrics])),
+                'recall': float(np.mean([m['recall'] for m in threshold_metrics])),
+                'f1': float(np.mean([m['f1'] for m in threshold_metrics])),
+                'mean_iou': float(np.mean([m['mean_iou'] for m in threshold_metrics])),
+            }
             if len(pred_segs) > 0 or len(true_segs) > 0:
                 total_precision += metrics['precision']
                 total_recall += metrics['recall']
@@ -362,8 +449,12 @@ def train_pitch_detector(
                     batch_labels = frame_labels.cpu().numpy()
 
                     for i in range(min(len(batch_preds), 6)):
-                        pred_segments = extract_segments_from_predictions(
-                            batch_preds[i], threshold=0.5, min_duration=3
+                        pred_segments = extract_segments_strict(
+                            batch_preds[i],
+                            threshold=eval_threshold,
+                            min_duration=eval_min_duration,
+                            max_duration=eval_max_duration,
+                            merge_gap=eval_merge_gap,
                         )
                         true_segments = extract_segments_from_predictions(
                             batch_labels[i], threshold=0.5, min_duration=1
@@ -380,7 +471,16 @@ def train_pitch_detector(
 
             valid_val_samples = 0
             for pred_segs, true_segs in zip(val_predictions, val_true_segments):
-                metrics = evaluate_pitch_detection(pred_segs, true_segs, iou_threshold=0.3)
+                threshold_metrics = [
+                    evaluate_pitch_detection(pred_segs, true_segs, iou_threshold=t)
+                    for t in iou_thresholds
+                ]
+                metrics = {
+                    'precision': float(np.mean([m['precision'] for m in threshold_metrics])),
+                    'recall': float(np.mean([m['recall'] for m in threshold_metrics])),
+                    'f1': float(np.mean([m['f1'] for m in threshold_metrics])),
+                    'mean_iou': float(np.mean([m['mean_iou'] for m in threshold_metrics])),
+                }
                 if len(pred_segs) > 0 or len(true_segs) > 0:
                     val_precision += metrics['precision']
                     val_recall += metrics['recall']
@@ -405,7 +505,9 @@ def train_pitch_detector(
         selection_iou = val_mean_iou if val_dataloader is not None else avg_mean_iou
         selection_precision = val_precision if val_dataloader is not None else avg_precision
         selection_recall = val_recall if val_dataloader is not None else avg_recall
-        selection_score = 0.60 * selection_iou + 0.30 * selection_precision + 0.10 * selection_recall
+        selection_score = 0.60 * selection_iou + 0.35 * selection_precision + 0.05 * selection_recall
+        if selection_precision < 0.03:
+            selection_score *= 0.5
 
         # Track best checkpoint using validation score when available
         if selection_score > best_score:
@@ -419,7 +521,8 @@ def train_pitch_detector(
             calibrated_config, calibration_metrics = calibrate_inference_config(
                 val_calibration_prediction_sequences if len(val_calibration_prediction_sequences) > 0 else calibration_prediction_sequences,
                 val_calibration_true_segments if len(val_calibration_true_segments) > 0 else calibration_true_segments,
-                fps=dataset.fps,
+                fps=train_dataset.fps,
+                iou_thresholds=iou_thresholds,
             )
             print(
                 "   🔧 Calibrated inference config: "
@@ -451,6 +554,8 @@ def train_pitch_detector(
                     'hyperparameters': {
                         'num_epochs': num_epochs,
                         'batch_size': batch_size,
+                        'window_size': window_size,
+                        'stride': stride,
                         'lr': lr,
                         'hidden_dim': 256,
                         'use_augmentation': use_augmentation,
@@ -461,6 +566,9 @@ def train_pitch_detector(
                         'feature_dropout_prob': feature_dropout_prob,
                         'val_ratio': val_ratio,
                         'hard_negative_ratio': hard_negative_ratio,
+                        'iou_thresholds': iou_thresholds,
+                        'balance_windows': balance_windows,
+                        'positive_window_target': positive_window_target,
                     },
                     'dataset_stats': dataset_stats,
                     'training_files': {

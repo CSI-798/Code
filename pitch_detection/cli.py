@@ -61,6 +61,16 @@ def train(
         "--batch-size", "-b",
         help="Batch size for training"
     ),
+    window_size: int = typer.Option(
+        100,
+        "--window-size",
+        help="Sliding window size (frames) for training samples"
+    ),
+    stride: int = typer.Option(
+        50,
+        "--stride",
+        help="Sliding window stride (frames) for training samples"
+    ),
     learning_rate: float = typer.Option(
         0.001,
         "--lr",
@@ -114,12 +124,27 @@ def train(
     val_ratio: float = typer.Option(
         0.33,
         "--val-ratio",
-        help="Fraction of input files used for validation checkpoint selection"
+        help="Fraction of sliding windows used for validation (sampled across all games)"
     ),
     hard_negative_ratio: float = typer.Option(
         3.0,
         "--hard-negative-ratio",
         help="Hard negative mining ratio (negatives per positive frame)"
+    ),
+    iou_thresholds: List[float] = typer.Option(
+        [0.3],
+        "--iou-threshold",
+        help="IoU threshold(s) for segment evaluation (repeat flag for multiple values)"
+    ),
+    balance_windows: bool = typer.Option(
+        True,
+        "--balance-windows/--no-balance-windows",
+        help="Balance pitch/non-pitch windows during training using weighted sampling"
+    ),
+    positive_window_target: float = typer.Option(
+        0.5,
+        "--positive-window-target",
+        help="Target ratio of pitch-containing windows when balanced sampling is enabled"
     ),
 ):
     """
@@ -145,6 +170,8 @@ def train(
     typer.echo(f"   Label files: {len(label_files)}")
     typer.echo(f"   Epochs: {num_epochs}")
     typer.echo(f"   Batch size: {batch_size}")
+    typer.echo(f"   Window size: {window_size}")
+    typer.echo(f"   Stride: {stride}")
     typer.echo(f"   Learning rate: {learning_rate}")
     typer.echo(f"   Checkpoint dir: {checkpoint_dir}")
     typer.echo(f"   Augmentation: {augment}")
@@ -156,6 +183,10 @@ def train(
         typer.echo(f"   Feature dropout prob: {feature_dropout_prob}")
     typer.echo(f"   Validation ratio: {val_ratio}")
     typer.echo(f"   Hard negative ratio: {hard_negative_ratio}")
+    typer.echo(f"   IoU thresholds: {', '.join(f'{t:.2f}' for t in iou_thresholds)}")
+    typer.echo(f"   Balance windows: {balance_windows}")
+    if balance_windows:
+        typer.echo(f"   Positive window target: {positive_window_target}")
     typer.echo("")
     
     # Convert paths to strings
@@ -170,6 +201,8 @@ def train(
             label_files=label_files_str,
             num_epochs=num_epochs,
             batch_size=batch_size,
+            window_size=window_size,
+            stride=stride,
             lr=learning_rate,
             save_best=True,
             checkpoint_dir=str(checkpoint_dir),
@@ -182,6 +215,9 @@ def train(
             feature_dropout_prob=feature_dropout_prob,
             val_ratio=val_ratio,
             hard_negative_ratio=hard_negative_ratio,
+            iou_thresholds=iou_thresholds,
+            balance_windows=balance_windows,
+            positive_window_target=positive_window_target,
         )
         
         typer.echo("")
@@ -240,6 +276,11 @@ def predict(
         "--fps",
         help="Frames per second"
     ),
+    max_duration_seconds: Optional[float] = typer.Option(
+        None,
+        "--max-duration-seconds",
+        help="Optional max predicted pitch duration in seconds (overrides checkpoint inference config)",
+    ),
     device: str = typer.Option(
         "auto",
         "--device", "-d",
@@ -274,6 +315,15 @@ def predict(
     try:
         # Load model
         model, info = load_best_model(str(checkpoint), device=device)
+
+        inference_cfg = info.get('inference_config')
+        if max_duration_seconds is not None:
+            inference_cfg = dict(inference_cfg or {})
+            inference_cfg['max_duration_frames'] = max(1, int(max_duration_seconds * fps))
+            typer.echo(
+                f"⏱️ Overriding max duration: {max_duration_seconds:.2f}s "
+                f"({inference_cfg['max_duration_frames']} frames @ {fps} fps)"
+            )
         
         typer.echo(f"🔮 Making predictions on {pose_file.name}")
         
@@ -285,7 +335,7 @@ def predict(
             fps=fps,
             threshold=threshold,
             device=device,
-            inference_config=info.get('inference_config'),
+            inference_config=inference_cfg,
         )
         
         typer.echo("")
@@ -312,7 +362,8 @@ def predict(
                 },
                 'parameters': {
                     'threshold': threshold,
-                    'inference_config': info.get('inference_config'),
+                    'max_duration_seconds': max_duration_seconds,
+                    'inference_config': inference_cfg,
                     'fps': fps
                 },
                 'segments': segments,
@@ -375,6 +426,11 @@ def evaluate(
         "--fps",
         help="Frames per second"
     ),
+    max_duration_seconds: Optional[float] = typer.Option(
+        None,
+        "--max-duration-seconds",
+        help="Optional max predicted pitch duration in seconds (overrides checkpoint inference config)",
+    ),
     device: str = typer.Option(
         "auto",
         "--device", "-d",
@@ -410,6 +466,15 @@ def evaluate(
     try:
         # Load model
         model, info = load_best_model(str(checkpoint), device=device)
+
+        inference_cfg = info.get('inference_config')
+        if max_duration_seconds is not None:
+            inference_cfg = dict(inference_cfg or {})
+            inference_cfg['max_duration_frames'] = max(1, int(max_duration_seconds * fps))
+            typer.echo(
+                f"⏱️ Overriding max duration: {max_duration_seconds:.2f}s "
+                f"({inference_cfg['max_duration_frames']} frames @ {fps} fps)"
+            )
         
         typer.echo(f"📊 Evaluating on {pose_file.name}")
         
@@ -422,7 +487,7 @@ def evaluate(
             fps=fps,
             threshold=threshold,
             device=device,
-            inference_config=info.get('inference_config'),
+            inference_config=inference_cfg,
         )
         
         typer.echo("")
